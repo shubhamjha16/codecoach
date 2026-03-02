@@ -1,21 +1,24 @@
 import * as vscode from 'vscode';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import { handleChatRequest } from './chatHandler';
 
 const execAsync = promisify(exec);
 const SESSION_KEY = 'codecoach.session';
 const PROFILE_KEY = 'codecoach.profile';
 
-type HintLevel = 1 | 2 | 3;
+let statusBarItem: vscode.StatusBarItem;
+let outputChannel: vscode.OutputChannel;
 
-type Difficulty = 'beginner' | 'intermediate' | 'advanced';
+export type HintLevel = 1 | 2 | 3;
+export type Difficulty = 'beginner' | 'intermediate' | 'advanced';
 
-interface Attempt {
+export interface Attempt {
   at: string;
   note: string;
 }
 
-interface EvaluationSnapshot {
+export interface EvaluationSnapshot {
   command: string;
   success: boolean;
   correctnessScore: number;
@@ -27,7 +30,7 @@ interface EvaluationSnapshot {
   runAt: string;
 }
 
-interface SessionState {
+export interface SessionState {
   challengeId: string;
   difficulty: Difficulty;
   startedAt: string;
@@ -37,7 +40,7 @@ interface SessionState {
   latestEvaluation?: EvaluationSnapshot;
 }
 
-interface LearnerProfile {
+export interface LearnerProfile {
   sessionsCompleted: number;
   currentStreak: number;
   bestStreak: number;
@@ -45,12 +48,22 @@ interface LearnerProfile {
   weakestAreas: Record<string, number>;
 }
 
-interface ChallengeCatalogItem {
+export interface ChallengeCatalogItem {
   id: string;
   difficulty?: Difficulty;
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+  // Initialize Output Channel
+  outputChannel = vscode.window.createOutputChannel('CodeCoach');
+
+  // Initialize Status Bar Item
+  statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  statusBarItem.command = 'codecoach.showProgress';
+  context.subscriptions.push(statusBarItem);
+
+  updateStatusBar(context);
+
   context.subscriptions.push(
     vscode.commands.registerCommand('codecoach.startSession', () => startSession(context)),
     vscode.commands.registerCommand('codecoach.logAttempt', () => logAttempt(context)),
@@ -60,21 +73,28 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codecoach.generateProgressReport', () => generateProgressReport(context)),
     vscode.commands.registerCommand('codecoach.endSession', () => endSession(context))
   );
+
+  // Register Chat Participant
+  if (vscode.chat && (vscode.chat as any).createChatParticipant) {
+    const participant = vscode.chat.createChatParticipant('codecoach', (request, chatContext, stream, token) => {
+      return handleChatRequest(request, chatContext, stream, token, context);
+    });
+  }
 }
 
 export function deactivate(): void {
   // no-op
 }
 
-function getSession(context: vscode.ExtensionContext): SessionState | undefined {
+export function getSession(context: vscode.ExtensionContext): SessionState | undefined {
   return context.workspaceState.get<SessionState>(SESSION_KEY);
 }
 
-async function setSession(context: vscode.ExtensionContext, session: SessionState | undefined): Promise<void> {
+export async function setSession(context: vscode.ExtensionContext, session: SessionState | undefined): Promise<void> {
   await context.workspaceState.update(SESSION_KEY, session);
 }
 
-function getProfile(context: vscode.ExtensionContext): LearnerProfile {
+export function getProfile(context: vscode.ExtensionContext): LearnerProfile {
   return context.globalState.get<LearnerProfile>(PROFILE_KEY, {
     sessionsCompleted: 0,
     currentStreak: 0,
@@ -83,11 +103,16 @@ function getProfile(context: vscode.ExtensionContext): LearnerProfile {
   });
 }
 
-async function setProfile(context: vscode.ExtensionContext, profile: LearnerProfile): Promise<void> {
+export async function setProfile(context: vscode.ExtensionContext, profile: LearnerProfile): Promise<void> {
   await context.globalState.update(PROFILE_KEY, profile);
 }
 
-async function startSession(context: vscode.ExtensionContext): Promise<void> {
+export async function startSession(context: vscode.ExtensionContext, customChallenge?: { id: string, difficulty?: Difficulty }): Promise<void> {
+  if (customChallenge) {
+    await internalStartSession(context, customChallenge.id, customChallenge.difficulty ?? 'beginner');
+    return;
+  }
+
   const catalog = getChallengeCatalog();
   const picked = await vscode.window.showQuickPick(
     [
@@ -118,6 +143,10 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     difficulty = 'beginner';
   }
 
+  await internalStartSession(context, challengeId, difficulty);
+}
+
+async function internalStartSession(context: vscode.ExtensionContext, challengeId: string, difficulty: Difficulty): Promise<void> {
   const session: SessionState = {
     challengeId,
     difficulty,
@@ -128,10 +157,67 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
   };
 
   await setSession(context, session);
-  vscode.window.showInformationMessage(`CodeCoach session started: ${challengeId} (${difficulty}).`);
+  updateStatusBar(context);
+  logToOutput(`🚀 Session started: ${challengeId} (${difficulty})`);
+
+  // Setup files for the user
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (folder) {
+    const baseName = challengeId.split('/').pop() || 'challenge';
+    const coachFolder = vscode.Uri.joinPath(folder, 'codecoach');
+
+    // Create folder if it doesn't exist
+    await vscode.workspace.fs.createDirectory(coachFolder);
+
+    const solutionPath = vscode.Uri.joinPath(coachFolder, `${baseName}.ts`);
+    const briefingPath = vscode.Uri.joinPath(coachFolder, `${baseName}.md`);
+
+    // Create solution file if it doesn't exist
+    try {
+      await vscode.workspace.fs.stat(solutionPath);
+    } catch {
+      const initialCode = `// Challenge: ${challengeId}\n// Difficulty: ${difficulty}\n\nexport function solve() {\n  // Implement your solution here\n}\n`;
+      await vscode.workspace.fs.writeFile(solutionPath, Buffer.from(initialCode));
+    }
+
+    // Always create/update briefing file
+    const briefingContent = buildBriefingContent(challengeId, difficulty);
+    await vscode.workspace.fs.writeFile(briefingPath, Buffer.from(briefingContent));
+
+    // Open files
+    const briefingDoc = await vscode.workspace.openTextDocument(briefingPath);
+    await vscode.window.showTextDocument(briefingDoc, { viewColumn: vscode.ViewColumn.Beside, preview: false });
+
+    const solutionDoc = await vscode.workspace.openTextDocument(solutionPath);
+    await vscode.window.showTextDocument(solutionDoc, { viewColumn: vscode.ViewColumn.One, preview: false });
+  }
+
+  vscode.window.showInformationMessage(`CodeCoach session started: ${challengeId} (${difficulty}). Check the briefing and start coding!`);
 }
 
-async function logAttempt(context: vscode.ExtensionContext): Promise<void> {
+function buildBriefingContent(challengeId: string, difficulty: Difficulty): string {
+  return `# CodeCoach Mission: ${challengeId}
+**Difficulty:** ${difficulty}
+**Status:** ACTIVE
+
+## Problem Description
+You have been assigned the challenge: \`${challengeId}\`. 
+
+Your goal is to implement an efficient solution in the companion file. CodeCoach will monitor your progress and provide hints if you get stuck (after you document your attempts).
+
+## Rules of Discipline
+1. **No Copy-Pasting:** Write every line yourself to build muscle memory.
+2. **Log Your Attempts:** Use \`@codecoach /log\` or the "Log Attempt" command to describe what you've tried.
+3. **Staged Hints:** Hints are earned through persistence, not requested immediately.
+
+## Getting Started
+1. Open the implementation file.
+2. Draft your strategy in comments.
+3. Run \`@codecoach /evaluate\` once you have a working solution.
+`;
+}
+
+export async function logAttempt(context: vscode.ExtensionContext): Promise<void> {
   const session = getSession(context);
   if (!session) {
     vscode.window.showWarningMessage('Start a CodeCoach session first.');
@@ -149,10 +235,11 @@ async function logAttempt(context: vscode.ExtensionContext): Promise<void> {
 
   session.attempts.push({ at: new Date().toISOString(), note });
   await setSession(context, session);
+  logToOutput(`📝 Attempt logged: "${note}"`);
   vscode.window.showInformationMessage(`Attempt logged. Total attempts: ${session.attempts.length}`);
 }
 
-async function requestHint(context: vscode.ExtensionContext): Promise<void> {
+export async function requestHint(context: vscode.ExtensionContext): Promise<void> {
   const session = getSession(context);
   if (!session) {
     vscode.window.showWarningMessage('Start a CodeCoach session first.');
@@ -192,10 +279,11 @@ async function requestHint(context: vscode.ExtensionContext): Promise<void> {
   session.hintsUsed.push(nextHintLevel);
   await setSession(context, session);
 
+  logToOutput(`💡 Hint requested: Level ${nextHintLevel}`);
   vscode.window.showInformationMessage(`Hint L${nextHintLevel}: ${buildHint(nextHintLevel, session.challengeId)}`);
 }
 
-function buildHint(level: HintLevel, challengeId: string): string {
+export function buildHint(level: HintLevel, challengeId: string): string {
   if (level === 1) {
     return `Restate ${challengeId} in your own words and list hard constraints before coding.`;
   }
@@ -207,7 +295,7 @@ function buildHint(level: HintLevel, challengeId: string): string {
   return 'Create targeted edge-case tests (empty, single-item, duplicates, max-size input) before rewriting logic.';
 }
 
-async function runEvaluation(context: vscode.ExtensionContext): Promise<void> {
+export async function runEvaluation(context: vscode.ExtensionContext): Promise<void> {
   const session = getSession(context);
   if (!session) {
     vscode.window.showWarningMessage('Start a CodeCoach session first.');
@@ -215,20 +303,35 @@ async function runEvaluation(context: vscode.ExtensionContext): Promise<void> {
   }
 
   const evaluationCommand = vscode.workspace.getConfiguration('codecoach').get<string>('evaluationCommand', 'npm test');
-  const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!folder) {
-    vscode.window.showWarningMessage('Open a workspace folder to run local evaluation.');
-    return;
-  }
-
   const started = Date.now();
   try {
+    const editor = vscode.window.activeTextEditor;
+    let folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+    if (editor) {
+      const fileUri = editor.document.uri;
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(fileUri);
+      if (workspaceFolder) {
+        folder = workspaceFolder.uri.fsPath;
+      }
+    }
+
+    if (!folder) {
+      throw new Error('Open a workspace folder to run local evaluation.');
+    }
+
     const { stdout, stderr } = await execAsync(evaluationCommand, { cwd: folder });
     const durationMs = Date.now() - started;
     const combinedOutput = `${stdout}\n${stderr}`;
 
     session.latestEvaluation = buildEvaluationSnapshot(true, evaluationCommand, combinedOutput, durationMs);
     await setSession(context, session);
+
+    logToOutput(`✅ Evaluation PASSED: ${session.challengeId}`);
+    logToOutput(`   Score: ${session.latestEvaluation.overallScore}/100`);
+    if (session.latestEvaluation.bruteForceSignals.length > 0) {
+      logToOutput(`   ⚠️ Signals: ${session.latestEvaluation.bruteForceSignals.join(', ')}`);
+    }
 
     vscode.window.showInformationMessage(
       `Evaluation passed. Overall score: ${session.latestEvaluation.overallScore}`
@@ -239,6 +342,10 @@ async function runEvaluation(context: vscode.ExtensionContext): Promise<void> {
 
     session.latestEvaluation = buildEvaluationSnapshot(false, evaluationCommand, output, durationMs);
     await setSession(context, session);
+
+    logToOutput(`❌ Evaluation FAILED: ${session.challengeId}`);
+    logToOutput(`   Score: ${session.latestEvaluation.overallScore}/100`);
+    logToOutput(`   Error: ${output.slice(0, 200)}...`);
 
     vscode.window.showWarningMessage(
       `Evaluation failed. Overall score: ${session.latestEvaluation.overallScore}`
@@ -309,14 +416,23 @@ function detectBruteForceSignals(): string[] {
   const text = editor.document.getText();
   const signals: string[] = [];
 
-  if (/for\s*\([^)]*\)\s*\{[\s\S]{0,200}for\s*\(/m.test(text)) {
-    signals.push('nested_loops');
+  // Look for nested loops (O(n^2) or worse)
+  if (/(for|while|foreach|loop|map).+[\s\S]{0,300}(for|while|foreach|loop|map)/im.test(text)) {
+    signals.push('nested_logic');
   }
-  if (/while\s*\([^)]*\)\s*\{[\s\S]{0,200}while\s*\(/m.test(text)) {
-    signals.push('nested_while_loops');
+
+  // Look for linear search inside a loop (often should be a hash map)
+  if (/\.includes\(|\.find\(|\.contains\(/.test(text) && /(for|while|loop)/i.test(text)) {
+    signals.push('search_inside_loop');
   }
-  if (/\.includes\([^)]*\)/.test(text) && /for\s*\(/.test(text)) {
-    signals.push('includes_inside_loop');
+
+  // Look for recursion (could be brute-force depth-first search)
+  const fnMatch = text.match(/function\s+(\w+)|const\s+(\w+)\s*=\s*\(.*?\)\s*=>/);
+  if (fnMatch) {
+    const fnName = fnMatch[1] || fnMatch[2];
+    if (fnName && new RegExp(`\\b${fnName}\\s*\\(`, 'g').test(text.replace(fnMatch[0], ''))) {
+      signals.push('recursion_detected');
+    }
   }
 
   return signals;
@@ -377,7 +493,7 @@ async function generateProgressReport(context: vscode.ExtensionContext): Promise
   await vscode.window.showTextDocument(doc, { preview: false });
 }
 
-async function endSession(context: vscode.ExtensionContext): Promise<void> {
+export async function endSession(context: vscode.ExtensionContext): Promise<void> {
   const session = getSession(context);
   if (!session) {
     vscode.window.showInformationMessage('No active CodeCoach session.');
@@ -386,22 +502,41 @@ async function endSession(context: vscode.ExtensionContext): Promise<void> {
 
   const profile = getProfile(context);
   const now = new Date();
-  const today = now.toISOString().slice(0, 10);
-  const last = profile.lastSessionDate;
+
+  // Use local date for streak calculation to avoid UTC rollover issues
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const lastDateStr = profile.lastSessionDate;
 
   profile.sessionsCompleted += 1;
-  if (!last) {
+
+  if (!lastDateStr) {
     profile.currentStreak = 1;
   } else {
-    const daysDiff = Math.floor((Date.parse(today) - Date.parse(last)) / (1000 * 60 * 60 * 24));
-    profile.currentStreak = daysDiff <= 1 ? profile.currentStreak + 1 : 1;
+    const lastDateParts = lastDateStr.split('-').map(Number);
+    const lastDate = new Date(lastDateParts[0], lastDateParts[1] - 1, lastDateParts[2]).getTime();
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    const diffDays = Math.round((today - lastDate) / oneDayMs);
+
+    if (diffDays === 1) {
+      profile.currentStreak += 1;
+    } else if (diffDays > 1) {
+      profile.currentStreak = 1;
+    }
+    // If diffDays === 0, streak stays the same (already practiced today)
   }
+
+  const dateString = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
   profile.bestStreak = Math.max(profile.bestStreak, profile.currentStreak);
-  profile.lastSessionDate = today;
+  profile.lastSessionDate = dateString;
   profile.weakestAreas[session.challengeId.split('/')[0] ?? 'general'] = session.latestEvaluation?.overallScore ?? 0;
 
   await setProfile(context, profile);
   await setSession(context, undefined);
+
+  updateStatusBar(context);
+  logToOutput(`🏁 Session ended: ${session.challengeId}`);
+  logToOutput(`   Final Streak: ${profile.currentStreak}`);
 
   vscode.window.showInformationMessage(
     `Session ended. Completed: ${profile.sessionsCompleted}, streak: ${profile.currentStreak}, best: ${profile.bestStreak}.`
@@ -411,8 +546,10 @@ async function endSession(context: vscode.ExtensionContext): Promise<void> {
 function getChallengeCatalog(): ChallengeCatalogItem[] {
   const raw = vscode.workspace.getConfiguration('codecoach').get<unknown[]>('challengeCatalog', []);
   const parsed = raw
-    .filter((item): item is ChallengeCatalogItem => typeof item === 'object' && item !== null && 'id' in item)
-    .map((item) => ({
+    .filter((item: unknown): item is Record<string, unknown> =>
+      typeof item === 'object' && item !== null && 'id' in item
+    )
+    .map((item: Record<string, unknown>) => ({
       id: String(item.id),
       difficulty: normalizeDifficulty(typeof item.difficulty === 'string' ? item.difficulty : undefined)
     }));
@@ -430,4 +567,23 @@ function normalizeDifficulty(value: string | undefined): Difficulty {
 
 function clampScore(score: number): number {
   return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function updateStatusBar(context: vscode.ExtensionContext): void {
+  const session = getSession(context);
+  const profile = getProfile(context);
+
+  const streakText = `🔥 ${profile.currentStreak}`;
+  const missionText = session ? ` | 🛡️ ${session.challengeId.split('/').pop()}` : '';
+
+  statusBarItem.text = `CodeCoach: ${streakText}${missionText}`;
+  statusBarItem.tooltip = session
+    ? `Active Mission: ${session.challengeId}\nStreak: ${profile.currentStreak} days`
+    : `No active mission\nStreak: ${profile.currentStreak} days`;
+  statusBarItem.show();
+}
+
+export function logToOutput(message: string): void {
+  const timestamp = new Date().toLocaleTimeString();
+  outputChannel.appendLine(`[${timestamp}] ${message}`);
 }
