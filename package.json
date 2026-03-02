@@ -1,0 +1,103 @@
+{
+  "name": "codecoach",
+  "displayName": "CodeCoach",
+  "description": "Structured coding discipline engine for VS Code",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Education",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:codecoach.startSession",
+    "onCommand:codecoach.logAttempt",
+    "onCommand:codecoach.requestHint",
+    "onCommand:codecoach.runEvaluation",
+    "onCommand:codecoach.showProgress",
+    "onCommand:codecoach.generateProgressReport",
+    "onCommand:codecoach.endSession"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codecoach.startSession",
+        "title": "CodeCoach: Start Session"
+      },
+      {
+        "command": "codecoach.logAttempt",
+        "title": "CodeCoach: Log Attempt"
+      },
+      {
+        "command": "codecoach.requestHint",
+        "title": "CodeCoach: Request Hint"
+      },
+      {
+        "command": "codecoach.runEvaluation",
+        "title": "CodeCoach: Run Local Evaluation"
+      },
+      {
+        "command": "codecoach.showProgress",
+        "title": "CodeCoach: Show Progress"
+      },
+      {
+        "command": "codecoach.generateProgressReport",
+        "title": "CodeCoach: Generate Progress Report"
+      },
+      {
+        "command": "codecoach.endSession",
+        "title": "CodeCoach: End Session"
+      }
+    ],
+    "configuration": {
+      "title": "CodeCoach",
+      "properties": {
+        "codecoach.evaluationCommand": {
+          "type": "string",
+          "default": "npm test -- --runInBand",
+          "description": "Local test command used for CodeCoach evaluation."
+        },
+        "codecoach.minimumAttemptsForHint": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "description": "Minimum number of attempts required before hints are unlocked."
+        },
+        "codecoach.requireExplanationForHint": {
+          "type": "boolean",
+          "default": true,
+          "description": "Require users to explain what they tried before hint requests."
+        },
+        "codecoach.challengeCatalog": {
+          "type": "array",
+          "default": [
+            {
+              "id": "arrays/two-sum-1",
+              "difficulty": "beginner"
+            },
+            {
+              "id": "strings/valid-anagram-1",
+              "difficulty": "beginner"
+            },
+            {
+              "id": "graphs/number-of-islands-1",
+              "difficulty": "intermediate"
+            }
+          ],
+          "description": "Challenge IDs and difficulty metadata used for guided sessions."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
